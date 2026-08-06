@@ -1,0 +1,14 @@
+Terminal 1:
+mkdir -p /tmp/chrome-reserve-profile
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/chrome-reserve-profile
+
+
+Terminal 2:
+python train_reserve_browser.py --cdp-port 9222 --from Dhaka --to Chattogram --doj 11-Aug-2026
+
+
+
+
+pass: v2uk18NN8xZiPn
