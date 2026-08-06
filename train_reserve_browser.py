@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from datetime import date, timedelta
-from urllib.parse import quote, urlencode, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -100,6 +100,11 @@ def build_search_url(fromcity: str, tocity: str, doj: str, train_class: str) -> 
             "",
         )
     )
+
+
+def url_doj(url: str) -> str | None:
+    values = parse_qs(urlsplit(url).query).get("doj")
+    return values[0] if values else None
 
 
 def click_book_now(page, train_filter: str, seat_class_filter: str | None) -> tuple[str, str] | None:
@@ -285,6 +290,16 @@ def attempt_booking(
             set_local_storage(page, token, args.device_key, args.device_id)
             page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
 
+    if args.doj:
+        final_doj = url_doj(page.url)
+        if final_doj and final_doj != args.doj:
+            print(
+                f"Tickets for {args.doj} are not available yet: the site redirected "
+                f"the search to {final_doj}.",
+                file=sys.stderr,
+            )
+            return -1, seats_to_reserve, []
+
     if not is_logged_in(page):
         print("Not logged in: token missing/expired.", file=sys.stderr)
         return 0, seats_to_reserve, []
@@ -442,7 +457,7 @@ def main() -> int:
         "Cloudflare Turnstile cft_response automatically)."
     )
     parser.add_argument("--from", dest="fromcity", default="Dhaka", help="Departure city")
-    parser.add_argument("--to", dest="tocity", default="Chattogram", help="Arrival city")
+    parser.add_argument("--to", dest="tocity", default="Cox's Baza", help="Arrival city")
     parser.add_argument(
         "--doj",
         default=None,
@@ -569,6 +584,17 @@ def main() -> int:
             page = context.new_page()
             url = build_search_url(args.fromcity, args.tocity, doj, args.train_class)
             ok_count, seats_to_reserve, _ = attempt_booking(page, args, url, token, attached)
+            if ok_count < 0:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                print(
+                    f"Stopping: booking not available for the requested date {doj}. "
+                    "Try again when tickets open for that date.",
+                    file=sys.stderr,
+                )
+                return 1
             if ok_count == seats_to_reserve and seats_to_reserve > 0:
                 active_page = page
                 print(f"\nSuccess on {doj}. Keeping this tab.")
