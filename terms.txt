@@ -12,3 +12,12 @@ python train_reserve_browser.py --cdp-port 9222 --from Dhaka --to Chattogram --d
 
 
 pass: v2uk18NN8xZiPn
+
+
+
+
+now what i want, continue from todays date to next 10 day. so currently i am providing doj
+
+python train_reserve_browser.py --cdp-port 9222 --from Dhaka --to Chattogram --doj 11-Aug-2026 --seats 2 --keep-open --no-continue
+
+if doj is not providied, from todays date, go upto next 10 days, try to find 

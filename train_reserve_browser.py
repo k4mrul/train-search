@@ -181,6 +181,52 @@ def find_available_seat(page, seat_filter: str | None, coach_filter: str | None)
     return None
 
 
+def couple_chamber_seats(page) -> list[str] | None:
+    rows = page.locator("app-seat-layout .seat-row")
+    current: list[str] = []
+    current_total = 0
+    for i in range(rows.count()):
+        row = rows.nth(i)
+        real = row.locator(".btn-seat:not(.seat-hidden)")
+        if real.count() == 0:
+            if current_total == 2 and len(current) == 2:
+                return current
+            current = []
+            current_total = 0
+            continue
+        current_total += real.count()
+        avail = row.locator(".btn-seat.seat-available:not(.seat-selected)")
+        for j in range(avail.count()):
+            text = avail.nth(j).inner_text().strip()
+            if text:
+                current.append(text)
+    if current_total == 2 and len(current) == 2:
+        return current
+    return None
+
+
+def find_couple_chamber(page, coach_filter: str | None) -> list[str] | None:
+    page.wait_for_selector("#select-bogie", timeout=60000000)
+    options = page.locator("#select-bogie option")
+    count = options.count()
+    for i in range(count):
+        opt = options.nth(i)
+        label = opt.inner_text().strip()
+        if coach_filter and coach_filter not in label:
+            continue
+        match = re.search(r"-\s*(\d+)\s*Seat", label)
+        seats = int(match.group(1)) if match else 0
+        if seats <= 0:
+            continue
+        value = opt.get_attribute("value")
+        page.select_option("#select-bogie", value=value)
+        page.wait_for_timeout(1500)
+        chamber = couple_chamber_seats(page)
+        if chamber:
+            return chamber
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Reserve a Bangladesh Railway seat in a real browser (handles the "
@@ -192,7 +238,7 @@ def main() -> int:
     parser.add_argument("--class", dest="train_class", default="AC_B", help="Seat class (default: AC_B)")
     parser.add_argument(
         "--train",
-        default="COXS BAZAR EXPRESS (814)",
+        default="MOHANAGAR EXPRESS (722)",
         help="Train name filter (substring); 'all' for every train",
     )
     parser.add_argument("--seat-class", help="Only book this seat class (defaults to --class)")
@@ -201,7 +247,8 @@ def main() -> int:
         "--seats",
         type=int,
         default=1,
-        help="Number of seats to reserve (1-4, default: 1)",
+        help="Number of seats to reserve (1-4, default: 1). With 2, both seats are "
+        "taken from a single private 2-berth chamber (couple cabin).",
     )
     parser.add_argument("--coach", help="Switch to this coach (e.g. GA); otherwise the first coach with seats is used")
     parser.add_argument("--device-key", default=DEVICE_KEY, help="X-Device-Key / localStorage 'ssdk'")
@@ -227,9 +274,10 @@ def main() -> int:
         help="Seconds to keep the browser open before closing (0 = keep forever until Ctrl+C)",
     )
     parser.add_argument(
-        "--no-continue",
+        "--continue",
+        dest="do_continue",
         action="store_true",
-        help="Do NOT click CONTINUE PURCHASE after reserving (default: click it)",
+        help="Click CONTINUE PURCHASE after reserving (default: do not click it)",
     )
     parser.add_argument("--timeout", type=int, default=120000, help="Wait timeout in ms")
     args = parser.parse_args()
@@ -394,21 +442,36 @@ def main() -> int:
             print("=== SEAT LAYOUT HTML (truncated) ===")
             print(html[:4000])
 
-        seat_loc = find_available_seat(page, args.seat, args.coach)
-        if not seat_loc:
-            print(
-                "No available seat to click"
-                + (f" (tried '{args.seat}')" if args.seat else "")
-                + ".",
-                file=sys.stderr,
-            )
-            close_browser()
-            return 1
-
         seats_to_reserve = max(1, min(args.seats, 4))
+        planned: list[str] = []
+        if seats_to_reserve == 2:
+            planned = find_couple_chamber(page, args.coach)
+            if not planned:
+                print(
+                    "No private 2-berth chamber (couple cabin) with both seats "
+                    "available. Only chambers with exactly two seats are considered "
+                    "for --seats 2.",
+                    file=sys.stderr,
+                )
+                close_browser()
+                return 1
+            print(f"Couple chamber found: {', '.join(planned)}")
+        else:
+            seat_loc = find_available_seat(page, args.seat, args.coach)
+            if not seat_loc:
+                print(
+                    "No available seat to click"
+                    + (f" (tried '{args.seat}')" if args.seat else "")
+                    + ".",
+                    file=sys.stderr,
+                )
+                close_browser()
+                return 1
+            planned = [seat_loc[1]]
+
         reserved = []
         for n in range(seats_to_reserve):
-            if n > 0:
+            if n > 0 and len(planned) < seats_to_reserve:
                 seat_loc = find_available_seat(page, None, args.coach)
                 if not seat_loc:
                     print(
@@ -416,7 +479,15 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     break
-            seat_el, seat_number = seat_loc
+                planned.append(seat_loc[1])
+            seat_number = planned[n]
+            seat_el = page.locator(f".btn-seat[title='{seat_number}']")
+            if seat_el.count() == 0:
+                print(
+                    f"Seat {seat_number} is not in the seat layout anymore.",
+                    file=sys.stderr,
+                )
+                break
             print(f"Clicking seat {seat_number} ({n+1}/{seats_to_reserve})...")
 
             try:
@@ -424,7 +495,7 @@ def main() -> int:
                     lambda r: RESERVE_MARKER in r.url and r.request.method == "PATCH",
                     timeout=args.timeout,
                 ) as resp_info:
-                    seat_el.click()
+                    seat_el.first.click()
                 resp = resp_info.value
             except Exception as exc:
                 print(f"No reserve-seat response: {exc}", file=sys.stderr)
@@ -454,7 +525,7 @@ def main() -> int:
         ok_count = sum(1 for r in reserved if r["success"])
         print(f"\nReserved {ok_count}/{len(reserved)} seat(s): {[r['seat'] for r in reserved]}")
 
-        if ok_count > 0 and not args.no_continue:
+        if ok_count > 0 and args.do_continue:
             print("Clicking CONTINUE PURCHASE...")
             try:
                 continue_btn = page.locator("#confirmbooking .continue-btn")
