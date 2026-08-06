@@ -457,7 +457,7 @@ def main() -> int:
         "Cloudflare Turnstile cft_response automatically)."
     )
     parser.add_argument("--from", dest="fromcity", default="Dhaka", help="Departure city")
-    parser.add_argument("--to", dest="tocity", default="Cox's Baza", help="Arrival city")
+    parser.add_argument("--to", dest="tocity", default="Cox's Bazar", help="Arrival city")
     parser.add_argument(
         "--doj",
         default=None,
@@ -508,6 +508,13 @@ def main() -> int:
         help="Click CONTINUE PURCHASE after reserving (default: do not click it)",
     )
     parser.add_argument("--timeout", type=int, default=120000, help="Wait timeout in ms")
+    parser.add_argument(
+        "--retry-interval",
+        type=int,
+        default=3,
+        help="Seconds to wait between retries when the requested date is not yet "
+        "available for booking",
+    )
     args = parser.parse_args()
 
     dates = journey_dates(args.doj)
@@ -581,29 +588,34 @@ def main() -> int:
         active_page = None
         for doj in dates:
             print(f"\n=== Trying {doj} ===")
-            page = context.new_page()
-            url = build_search_url(args.fromcity, args.tocity, doj, args.train_class)
-            ok_count, seats_to_reserve, _ = attempt_booking(page, args, url, token, attached)
-            if ok_count < 0:
+            while True:
+                page = context.new_page()
+                url = build_search_url(args.fromcity, args.tocity, doj, args.train_class)
+                ok_count, seats_to_reserve, _ = attempt_booking(page, args, url, token, attached)
+                if ok_count < 0:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                    print(
+                        f"Tickets for {doj} are not yet available; retrying in "
+                        f"{args.retry_interval}s... (Ctrl+C to stop)",
+                        file=sys.stderr,
+                    )
+                    time.sleep(args.retry_interval)
+                    continue
+                if ok_count == seats_to_reserve and seats_to_reserve > 0:
+                    active_page = page
+                    print(f"\nSuccess on {doj}. Keeping this tab.")
+                    break
+                print(f"No successful booking on {doj}.", file=sys.stderr)
                 try:
                     page.close()
                 except Exception:
                     pass
-                print(
-                    f"Stopping: booking not available for the requested date {doj}. "
-                    "Try again when tickets open for that date.",
-                    file=sys.stderr,
-                )
-                return 1
-            if ok_count == seats_to_reserve and seats_to_reserve > 0:
-                active_page = page
-                print(f"\nSuccess on {doj}. Keeping this tab.")
                 break
-            print(f"No successful booking on {doj}.", file=sys.stderr)
-            try:
-                page.close()
-            except Exception:
-                pass
+            if active_page is not None:
+                break
 
         if active_page is None:
             print("Could not book on any of the tried dates.", file=sys.stderr)
