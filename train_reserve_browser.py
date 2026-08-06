@@ -5,7 +5,8 @@ import os
 import re
 import sys
 import time
-from urllib.parse import urlencode, urlunsplit
+from datetime import date, timedelta
+from urllib.parse import quote, urlencode, urlunsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -93,7 +94,8 @@ def build_search_url(fromcity: str, tocity: str, doj: str, train_class: str) -> 
                     "tocity": tocity,
                     "doj": doj,
                     "class": train_class,
-                }
+                },
+                quote_via=quote,
             ),
             "",
         )
@@ -227,6 +229,213 @@ def find_couple_chamber(page, coach_filter: str | None) -> list[str] | None:
     return None
 
 
+def journey_dates(doj: str | None) -> list[str]:
+    if doj:
+        return [doj]
+    today = date.today()
+    return [(today + timedelta(days=i)).strftime("%d-%b-%Y") for i in range(11)]
+
+
+def attempt_booking(
+    page,
+    args,
+    url: str,
+    token: str | None,
+    attached: bool,
+) -> tuple[int, int, list]:
+    seats_to_reserve = max(1, min(args.seats, 4))
+    turnstile_errors: list[str] = []
+
+    def on_response(resp) -> None:
+        if RESERVE_MARKER in resp.url and resp.request.method == "PATCH":
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"_raw": (resp.text() if resp.text else "")[:500]}
+            print(f"\n[reserve-seat] HTTP {resp.status}")
+            print(json.dumps(body, indent=2))
+
+    def on_console(msg) -> None:
+        text = msg.text
+        if "turnstile" in text.lower() or "600010" in text:
+            turnstile_errors.append(text)
+            print(f"[turnstile] {text}", file=sys.stderr)
+
+    page.on("response", on_response)
+    page.on("console", on_console)
+
+    print(f"Loading: {url}")
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+    except Exception as exc:
+        print(f"Navigation failed: {exc}", file=sys.stderr)
+        return 0, seats_to_reserve, []
+
+    if not attached:
+        set_local_storage(page, token or "", args.device_key, args.device_id)
+        page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+    else:
+        if not is_logged_in(page):
+            if not token:
+                print(
+                    "Attached Chrome is not logged in and TOKEN env is not set.",
+                    file=sys.stderr,
+                )
+                return 0, seats_to_reserve, []
+            set_local_storage(page, token, args.device_key, args.device_id)
+            page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+
+    if not is_logged_in(page):
+        print("Not logged in: token missing/expired.", file=sys.stderr)
+        return 0, seats_to_reserve, []
+
+    try:
+        page.wait_for_selector("app-single-trip", timeout=args.timeout)
+        print("Search results loaded.")
+    except Exception:
+        print("No search results appeared.", file=sys.stderr)
+        if turnstile_errors:
+            print("Turnstile reported errors during page load:", file=sys.stderr)
+            for e in turnstile_errors[:5]:
+                print(f"  {e}", file=sys.stderr)
+        return 0, seats_to_reserve, []
+
+    seat_class = args.seat_class or args.train_class
+    result = click_book_now(page, args.train, seat_class)
+    if not result:
+        print(
+            f"No BOOK NOW button found for '{args.train}'"
+            + (f" / '{seat_class}'" if seat_class else "")
+            + " with available seats.",
+            file=sys.stderr,
+        )
+        return 0, seats_to_reserve, []
+    train_name, cls_name = result
+    print(f"Clicked BOOK NOW for {train_name} - {cls_name}. Waiting for seat layout...")
+
+    try:
+        page.wait_for_selector("app-seat-layout", timeout=args.timeout)
+        print("Seat layout opened.")
+    except Exception:
+        print("Seat layout did not open.", file=sys.stderr)
+        if turnstile_errors:
+            print("Turnstile reported errors:", file=sys.stderr)
+            for e in turnstile_errors[:5]:
+                print(f"  {e}", file=sys.stderr)
+        print(
+            "If you see Cloudflare error 600010, the automated browser fingerprint is being "
+            "blocked. Use --cdp-port to drive your real Chrome instead.",
+            file=sys.stderr,
+        )
+        return 0, seats_to_reserve, []
+
+    if args.dump_layout:
+        html = page.locator("app-seat-layout").inner_html()
+        print("=== SEAT LAYOUT HTML (truncated) ===")
+        print(html[:4000])
+
+    planned: list[str] = []
+    if seats_to_reserve == 2:
+        planned = find_couple_chamber(page, args.coach)
+        if not planned:
+            print(
+                "No private 2-berth chamber (couple cabin) with both seats available "
+                "on this date.",
+                file=sys.stderr,
+            )
+            return 0, seats_to_reserve, []
+        print(f"Couple chamber found: {', '.join(planned)}")
+    else:
+        seat_loc = find_available_seat(page, args.seat, args.coach)
+        if not seat_loc:
+            print(
+                "No available seat to click"
+                + (f" (tried '{args.seat}')" if args.seat else "")
+                + " on this date.",
+                file=sys.stderr,
+            )
+            return 0, seats_to_reserve, []
+        planned = [seat_loc[1]]
+
+    reserved: list[dict] = []
+    for n in range(seats_to_reserve):
+        if n > 0 and len(planned) < seats_to_reserve:
+            seat_loc = find_available_seat(page, None, args.coach)
+            if not seat_loc:
+                print(
+                    f"Only {n} of {seats_to_reserve} seat(s) were available.",
+                    file=sys.stderr,
+                )
+                break
+            planned.append(seat_loc[1])
+        seat_number = planned[n]
+        seat_el = page.locator(f".btn-seat[title='{seat_number}']")
+        if seat_el.count() == 0:
+            print(
+                f"Seat {seat_number} is not in the seat layout anymore.",
+                file=sys.stderr,
+            )
+            break
+        print(f"Clicking seat {seat_number} ({n+1}/{seats_to_reserve})...")
+
+        try:
+            with page.expect_response(
+                lambda r: RESERVE_MARKER in r.url and r.request.method == "PATCH",
+                timeout=args.timeout,
+            ) as resp_info:
+                seat_el.first.click()
+            resp = resp_info.value
+        except Exception as exc:
+            print(f"No reserve-seat response: {exc}", file=sys.stderr)
+            if turnstile_errors:
+                print("Turnstile reported errors:", file=sys.stderr)
+                for e in turnstile_errors[:5]:
+                    print(f"  {e}", file=sys.stderr)
+            break
+
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+        print(f"[reserve-seat] HTTP {resp.status}")
+        print(json.dumps(body, indent=2) if body is not None else resp.text()[:500])
+
+        ok = isinstance(body, dict) and isinstance(body.get("data"), dict) and body["data"].get("ack") == 1
+        reserved.append({"seat": seat_number, "success": ok, "body": body})
+        if ok:
+            print(
+                f"\nSUCCESS: {body['data'].get('message', 'Reserved!')} - seat {seat_number}"
+            )
+        else:
+            print(f"\nSeat {seat_number} did not reserve; see response above.", file=sys.stderr)
+
+    ok_count = sum(1 for r in reserved if r["success"])
+    print(f"\nReserved {ok_count}/{len(reserved)} seat(s): {[r['seat'] for r in reserved]}")
+
+    if ok_count > 0 and args.do_continue:
+        print("Clicking CONTINUE PURCHASE...")
+        try:
+            continue_btn = page.locator("#confirmbooking .continue-btn")
+            if continue_btn.count() == 0:
+                continue_btn = page.locator(".continue-btn")
+            if continue_btn.count() == 0:
+                print("CONTINUE PURCHASE button not found.", file=sys.stderr)
+            else:
+                with page.expect_navigation(timeout=args.timeout) as nav_info:
+                    continue_btn.first.click()
+                nav_info.value
+                print(f"Navigated to: {page.url}")
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=args.timeout)
+                except Exception:
+                    pass
+                print("CONTINUE PURCHASE clicked.")
+        except Exception as exc:
+            print(f"Error clicking CONTINUE PURCHASE: {exc}", file=sys.stderr)
+
+    return ok_count, seats_to_reserve, reserved
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Reserve a Bangladesh Railway seat in a real browser (handles the "
@@ -234,11 +443,15 @@ def main() -> int:
     )
     parser.add_argument("--from", dest="fromcity", default="Dhaka", help="Departure city")
     parser.add_argument("--to", dest="tocity", default="Chattogram", help="Arrival city")
-    parser.add_argument("--doj", default="11-Aug-2026", help="Date of journey, e.g. 11-Aug-2026")
+    parser.add_argument(
+        "--doj",
+        default=None,
+        help="Date of journey, e.g. 11-Aug-2026. Omit to try the next 11 days from today.",
+    )
     parser.add_argument("--class", dest="train_class", default="AC_B", help="Seat class (default: AC_B)")
     parser.add_argument(
         "--train",
-        default="MOHANAGAR EXPRESS (722)",
+        default="COXS BAZAR EXPRESS (814)",
         help="Train name filter (substring); 'all' for every train",
     )
     parser.add_argument("--seat-class", help="Only book this seat class (defaults to --class)")
@@ -282,14 +495,14 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=120000, help="Wait timeout in ms")
     args = parser.parse_args()
 
-    url = build_search_url(args.fromcity, args.tocity, args.doj, args.train_class)
-    print(f"Target: {url}")
+    dates = journey_dates(args.doj)
+    print(f"Will try {len(dates)} date(s): {', '.join(dates)}")
 
     with sync_playwright() as p:
         attached = False
 
-        def close_browser() -> None:
-            if args.keep_open:
+        def close_browser(keep_page=None) -> None:
+            if args.keep_open and keep_page is not None:
                 if args.keep_timeout and args.keep_timeout > 0:
                     print(
                         f"Keeping the browser open for {args.keep_timeout}s... "
@@ -307,11 +520,15 @@ def main() -> int:
                             and time.monotonic() - start >= args.keep_timeout
                         ):
                             break
-                        page.wait_for_timeout(1000)
+                        keep_page.wait_for_timeout(1000)
                 except KeyboardInterrupt:
                     pass
             if attached:
-                page.close()
+                if keep_page is not None:
+                    try:
+                        keep_page.close()
+                    except Exception:
+                        pass
             else:
                 browser.close()
 
@@ -333,7 +550,6 @@ def main() -> int:
                 )
                 return 1
             context = browser.contexts[0]
-            page = context.new_page()
         else:
             browser = p.chromium.launch(
                 channel="chrome",
@@ -342,211 +558,33 @@ def main() -> int:
             )
             context = browser.new_context(user_agent=USER_AGENT)
             context.add_init_script(STEALTH_JS)
-            page = context.new_page()
 
-        reserve_results: list[dict] = []
-        turnstile_errors: list[str] = []
-
-        def on_response(resp) -> None:
-            if RESERVE_MARKER in resp.url and resp.request.method == "PATCH":
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = {"_raw": (resp.text() if resp.text else "")[:500]}
-                reserve_results.append({"status": resp.status, "body": body})
-                print(f"\n[reserve-seat] HTTP {resp.status}")
-                print(json.dumps(body, indent=2))
-
-        def on_console(msg) -> None:
-            text = msg.text
-            if "turnstile" in text.lower() or "600010" in text:
-                turnstile_errors.append(text)
-                print(f"[turnstile] {text}", file=sys.stderr)
-
-        page.on("response", on_response)
-        page.on("console", on_console)
-
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
-        except Exception as exc:
-            print(f"Navigation failed: {exc}", file=sys.stderr)
-            close_browser()
-            return 1
-
+        token = os.environ.get("TOKEN")
         if not attached:
-            set_local_storage(page, token_for(env=os.environ.get("TOKEN")), args.device_key, args.device_id)
-            page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
-        else:
-            if not is_logged_in(page):
-                tok = os.environ.get("TOKEN")
-                if not tok:
-                    print(
-                        "Attached Chrome is not logged in and TOKEN env is not set.",
-                        file=sys.stderr,
-                    )
-                    close_browser()
-                    return 1
-                set_local_storage(page, tok, args.device_key, args.device_id)
-                page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+            token = token_for(token)
 
-        if not is_logged_in(page):
-            print("Not logged in: token missing/expired.", file=sys.stderr)
-            close_browser()
-            return 1
-
-        try:
-            page.wait_for_selector("app-single-trip", timeout=args.timeout)
-            print("Search results loaded.")
-        except Exception:
-            print("No search results appeared.", file=sys.stderr)
-            if turnstile_errors:
-                print("Turnstile reported errors during page load:", file=sys.stderr)
-                for e in turnstile_errors[:5]:
-                    print(f"  {e}", file=sys.stderr)
-            close_browser()
-            return 1
-
-        seat_class = args.seat_class or args.train_class
-        result = click_book_now(page, args.train, seat_class)
-        if not result:
-            print(
-                f"No BOOK NOW button found for '{args.train}'"
-                + (f" / '{seat_class}'" if seat_class else "")
-                + " with available seats.",
-                file=sys.stderr,
-            )
-            close_browser()
-            return 1
-        train_name, cls_name = result
-        print(f"Clicked BOOK NOW for {train_name} - {cls_name}. Waiting for seat layout...")
-
-        try:
-            page.wait_for_selector("app-seat-layout", timeout=args.timeout)
-            print("Seat layout opened.")
-        except Exception:
-            print("Seat layout did not open.", file=sys.stderr)
-            if turnstile_errors:
-                print("Turnstile reported errors:", file=sys.stderr)
-                for e in turnstile_errors[:5]:
-                    print(f"  {e}", file=sys.stderr)
-            print(
-                "If you see Cloudflare error 600010, the automated browser fingerprint is being "
-                "blocked. Use --cdp-port to drive your real Chrome instead.",
-                file=sys.stderr,
-            )
-            close_browser()
-            return 1
-
-        if args.dump_layout:
-            html = page.locator("app-seat-layout").inner_html()
-            print("=== SEAT LAYOUT HTML (truncated) ===")
-            print(html[:4000])
-
-        seats_to_reserve = max(1, min(args.seats, 4))
-        planned: list[str] = []
-        if seats_to_reserve == 2:
-            planned = find_couple_chamber(page, args.coach)
-            if not planned:
-                print(
-                    "No private 2-berth chamber (couple cabin) with both seats "
-                    "available. Only chambers with exactly two seats are considered "
-                    "for --seats 2.",
-                    file=sys.stderr,
-                )
-                close_browser()
-                return 1
-            print(f"Couple chamber found: {', '.join(planned)}")
-        else:
-            seat_loc = find_available_seat(page, args.seat, args.coach)
-            if not seat_loc:
-                print(
-                    "No available seat to click"
-                    + (f" (tried '{args.seat}')" if args.seat else "")
-                    + ".",
-                    file=sys.stderr,
-                )
-                close_browser()
-                return 1
-            planned = [seat_loc[1]]
-
-        reserved = []
-        for n in range(seats_to_reserve):
-            if n > 0 and len(planned) < seats_to_reserve:
-                seat_loc = find_available_seat(page, None, args.coach)
-                if not seat_loc:
-                    print(
-                        f"Only {n} of {seats_to_reserve} seat(s) were available.",
-                        file=sys.stderr,
-                    )
-                    break
-                planned.append(seat_loc[1])
-            seat_number = planned[n]
-            seat_el = page.locator(f".btn-seat[title='{seat_number}']")
-            if seat_el.count() == 0:
-                print(
-                    f"Seat {seat_number} is not in the seat layout anymore.",
-                    file=sys.stderr,
-                )
+        active_page = None
+        for doj in dates:
+            print(f"\n=== Trying {doj} ===")
+            page = context.new_page()
+            url = build_search_url(args.fromcity, args.tocity, doj, args.train_class)
+            ok_count, seats_to_reserve, _ = attempt_booking(page, args, url, token, attached)
+            if ok_count == seats_to_reserve and seats_to_reserve > 0:
+                active_page = page
+                print(f"\nSuccess on {doj}. Keeping this tab.")
                 break
-            print(f"Clicking seat {seat_number} ({n+1}/{seats_to_reserve})...")
-
+            print(f"No successful booking on {doj}.", file=sys.stderr)
             try:
-                with page.expect_response(
-                    lambda r: RESERVE_MARKER in r.url and r.request.method == "PATCH",
-                    timeout=args.timeout,
-                ) as resp_info:
-                    seat_el.first.click()
-                resp = resp_info.value
-            except Exception as exc:
-                print(f"No reserve-seat response: {exc}", file=sys.stderr)
-                if turnstile_errors:
-                    print("Turnstile reported errors:", file=sys.stderr)
-                    for e in turnstile_errors[:5]:
-                        print(f"  {e}", file=sys.stderr)
-                close_browser()
-                return 1
-
-            try:
-                body = resp.json()
+                page.close()
             except Exception:
-                body = None
-            print(f"[reserve-seat] HTTP {resp.status}")
-            print(json.dumps(body, indent=2) if body is not None else resp.text()[:500])
+                pass
 
-            ok = isinstance(body, dict) and isinstance(body.get("data"), dict) and body["data"].get("ack") == 1
-            reserved.append({"seat": seat_number, "success": ok, "body": body})
-            if ok:
-                print(
-                    f"\nSUCCESS: {body['data'].get('message', 'Reserved!')} - seat {seat_number}"
-                )
-            else:
-                print(f"\nSeat {seat_number} did not reserve; see response above.", file=sys.stderr)
+        if active_page is None:
+            print("Could not book on any of the tried dates.", file=sys.stderr)
+            close_browser()
+            return 1
 
-        ok_count = sum(1 for r in reserved if r["success"])
-        print(f"\nReserved {ok_count}/{len(reserved)} seat(s): {[r['seat'] for r in reserved]}")
-
-        if ok_count > 0 and args.do_continue:
-            print("Clicking CONTINUE PURCHASE...")
-            try:
-                continue_btn = page.locator("#confirmbooking .continue-btn")
-                if continue_btn.count() == 0:
-                    continue_btn = page.locator(".continue-btn")
-                if continue_btn.count() == 0:
-                    print("CONTINUE PURCHASE button not found.", file=sys.stderr)
-                else:
-                    with page.expect_navigation(timeout=args.timeout) as nav_info:
-                        continue_btn.first.click()
-                    nav_info.value
-                    print(f"Navigated to: {page.url}")
-                    try:
-                        page.wait_for_load_state("domcontentloaded", timeout=args.timeout)
-                    except Exception:
-                        pass
-                    print("CONTINUE PURCHASE clicked.")
-            except Exception as exc:
-                print(f"Error clicking CONTINUE PURCHASE: {exc}", file=sys.stderr)
-
-        close_browser()
+        close_browser(active_page)
     return 0
 
 
