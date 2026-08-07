@@ -118,6 +118,13 @@ def click_book_now(page, train_filter: str, seat_class_filter: str | None) -> tu
         name = name_el.inner_text().strip()
         if train_filter.lower() not in name.lower():
             continue
+        collapse_btn = trip.locator(".trip-collapse-btn").first
+        collapsible = trip.locator(".trip-collapsible").first
+        if collapse_btn.count() > 0 and collapsible.count() > 0:
+            div_class = collapsible.get_attribute("class") or ""
+            if "trip-collapsed" not in div_class:
+                collapse_btn.click()
+                page.wait_for_timeout(500)
         seats = trip.locator(".single-seat-class")
         for j in range(seats.count()):
             seat = seats.nth(j)
@@ -231,6 +238,45 @@ def find_couple_chamber(page, coach_filter: str | None) -> list[str] | None:
         chamber = couple_chamber_seats(page)
         if chamber:
             return chamber
+    return None
+
+
+def find_chamber_with_seats(page, seats_needed: int, coach_filter: str | None) -> list[str] | None:
+    page.wait_for_selector("#select-bogie", timeout=60000000)
+    options = page.locator("#select-bogie option")
+    count = options.count()
+    for i in range(count):
+        opt = options.nth(i)
+        label = opt.inner_text().strip()
+        if coach_filter and coach_filter not in label:
+            continue
+        match = re.search(r"-\s*(\d+)\s*Seat", label)
+        total = int(match.group(1)) if match else 0
+        if total < seats_needed:
+            continue
+        value = opt.get_attribute("value")
+        page.select_option("#select-bogie", value=value)
+        page.wait_for_timeout(1500)
+        rows = page.locator("app-seat-layout .seat-row")
+        current: list[str] = []
+        current_total = 0
+        for r in range(rows.count()):
+            row = rows.nth(r)
+            real = row.locator(".btn-seat:not(.seat-hidden)")
+            if real.count() == 0:
+                if current_total == seats_needed and len(current) == seats_needed:
+                    return current
+                current = []
+                current_total = 0
+                continue
+            current_total += real.count()
+            avail = row.locator(".btn-seat.seat-available:not(.seat-selected)")
+            for j in range(avail.count()):
+                text = avail.nth(j).inner_text().strip()
+                if text:
+                    current.append(text)
+        if current_total == seats_needed and len(current) == seats_needed:
+            return current
     return None
 
 
@@ -360,6 +406,16 @@ def attempt_booking(
             )
             return 0, seats_to_reserve, []
         print(f"Couple chamber found: {', '.join(planned)}")
+    elif seats_to_reserve >= 3:
+        planned = find_chamber_with_seats(page, seats_to_reserve, args.coach)
+        if not planned:
+            print(
+                f"No single chamber with {seats_to_reserve} available seats together "
+                "on this date.",
+                file=sys.stderr,
+            )
+            return 0, seats_to_reserve, []
+        print(f"Chamber seats found: {', '.join(planned)}")
     else:
         seat_loc = find_available_seat(page, args.seat, args.coach)
         if not seat_loc:
@@ -476,7 +532,8 @@ def main() -> int:
         type=int,
         default=1,
         help="Number of seats to reserve (1-4, default: 1). With 2, both seats are "
-        "taken from a single private 2-berth chamber (couple cabin).",
+        "taken from a single private 2-berth chamber (couple cabin). With 3+, seats "
+        "are taken together from a single chamber (same seat row).",
     )
     parser.add_argument("--coach", help="Switch to this coach (e.g. GA); otherwise the first coach with seats is used")
     parser.add_argument("--device-key", default=DEVICE_KEY, help="X-Device-Key / localStorage 'ssdk'")
