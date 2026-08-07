@@ -362,71 +362,121 @@ def attempt_booking(
         return 0, seats_to_reserve, []
 
     seat_class = args.seat_class or args.train_class
-    result = click_book_now(page, args.train, seat_class)
-    if not result:
-        print(
-            f"No BOOK NOW button found for '{args.train}'"
-            + (f" / '{seat_class}'" if seat_class else "")
-            + " with available seats.",
-            file=sys.stderr,
-        )
-        return 0, seats_to_reserve, []
-    train_name, cls_name = result
-    print(f"Clicked BOOK NOW for {train_name} - {cls_name}. Waiting for seat layout...")
 
-    try:
-        page.wait_for_selector("app-seat-layout", timeout=args.timeout)
-        print("Seat layout opened.")
-    except Exception:
-        print("Seat layout did not open.", file=sys.stderr)
-        if turnstile_errors:
-            print("Turnstile reported errors:", file=sys.stderr)
-            for e in turnstile_errors[:5]:
-                print(f"  {e}", file=sys.stderr)
-        print(
-            "If you see Cloudflare error 600010, the automated browser fingerprint is being "
-            "blocked. Use --cdp-port to drive your real Chrome instead.",
-            file=sys.stderr,
-        )
-        return 0, seats_to_reserve, []
-
-    if args.dump_layout:
-        html = page.locator("app-seat-layout").inner_html()
-        print("=== SEAT LAYOUT HTML (truncated) ===")
-        print(html[:4000])
-
-    planned: list[str] = []
-    if seats_to_reserve == 2:
-        planned = find_couple_chamber(page, args.coach)
-        if not planned:
-            print(
-                "No private 2-berth chamber (couple cabin) with both seats available "
-                "on this date.",
-                file=sys.stderr,
-            )
-            return 0, seats_to_reserve, []
-        print(f"Couple chamber found: {', '.join(planned)}")
-    elif seats_to_reserve >= 3:
-        planned = find_chamber_with_seats(page, seats_to_reserve, args.coach)
-        if not planned:
-            print(
-                f"No single chamber with {seats_to_reserve} available seats together "
-                "on this date.",
-                file=sys.stderr,
-            )
-            return 0, seats_to_reserve, []
-        print(f"Chamber seats found: {', '.join(planned)}")
-    else:
+    def _find_seats() -> list[str] | None:
+        if seats_to_reserve == 2:
+            return find_couple_chamber(page, args.coach)
+        if seats_to_reserve >= 3:
+            return find_chamber_with_seats(page, seats_to_reserve, args.coach)
         seat_loc = find_available_seat(page, args.seat, args.coach)
-        if not seat_loc:
+        return [seat_loc[1]] if seat_loc else None
+
+    def _open_seat_layout(search_url: str) -> tuple[str, str] | None:
+        page.goto(search_url, wait_until="domcontentloaded", timeout=args.timeout)
+        try:
+            page.wait_for_selector("app-single-trip", timeout=args.timeout)
+        except Exception:
+            print("No search results appeared.", file=sys.stderr)
+            return None
+        result = click_book_now(page, args.train, seat_class)
+        if not result:
             print(
-                "No available seat to click"
-                + (f" (tried '{args.seat}')" if args.seat else "")
-                + " on this date.",
+                f"No BOOK NOW button found for '{args.train}'"
+                + (f" / '{seat_class}'" if seat_class else "")
+                + " with available seats.",
+                file=sys.stderr,
+            )
+            return None
+        train_name, cls_name = result
+        print(f"Clicked BOOK NOW for {train_name} - {cls_name}. Waiting for seat layout...")
+        try:
+            page.wait_for_selector("app-seat-layout", timeout=args.timeout)
+        except Exception:
+            print("Seat layout did not open.", file=sys.stderr)
+            return None
+        print("Seat layout opened.")
+        return train_name, cls_name
+
+    if args.seat_retry:
+        print(
+            f"Polling for {seats_to_reserve} seat(s) every "
+            f"{args.seat_retry_interval}s — full page refresh each cycle (Ctrl+C to stop)"
+        )
+        planned: list[str] = []
+        while not planned:
+            if not _open_seat_layout(url):
+                return 0, seats_to_reserve, []
+            planned = _find_seats() or []
+            if not planned:
+                print(
+                    f"Seats not available. Refreshing in {args.seat_retry_interval}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(args.seat_retry_interval)
+        if seats_to_reserve == 2:
+            print(f"Couple chamber found: {', '.join(planned)}")
+        elif seats_to_reserve >= 3:
+            print(f"Chamber seats found: {', '.join(planned)}")
+    else:
+        result = click_book_now(page, args.train, seat_class)
+        if not result:
+            print(
+                f"No BOOK NOW button found for '{args.train}'"
+                + (f" / '{seat_class}'" if seat_class else "")
+                + " with available seats.",
                 file=sys.stderr,
             )
             return 0, seats_to_reserve, []
-        planned = [seat_loc[1]]
+        train_name, cls_name = result
+        print(f"Clicked BOOK NOW for {train_name} - {cls_name}. Waiting for seat layout...")
+
+        try:
+            page.wait_for_selector("app-seat-layout", timeout=args.timeout)
+            print("Seat layout opened.")
+        except Exception:
+            print("Seat layout did not open.", file=sys.stderr)
+            if turnstile_errors:
+                print("Turnstile reported errors:", file=sys.stderr)
+                for e in turnstile_errors[:5]:
+                    print(f"  {e}", file=sys.stderr)
+            print(
+                "If you see Cloudflare error 600010, the automated browser fingerprint is being "
+                "blocked. Use --cdp-port to drive your real Chrome instead.",
+                file=sys.stderr,
+            )
+            return 0, seats_to_reserve, []
+
+        if args.dump_layout:
+            html = page.locator("app-seat-layout").inner_html()
+            print("=== SEAT LAYOUT HTML (truncated) ===")
+            print(html[:4000])
+
+        planned = _find_seats()
+        if not planned:
+            if seats_to_reserve == 2:
+                print(
+                    "No private 2-berth chamber (couple cabin) with both seats available "
+                    "on this date.",
+                    file=sys.stderr,
+                )
+            elif seats_to_reserve >= 3:
+                print(
+                    f"No single chamber with {seats_to_reserve} available seats together "
+                    "on this date.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "No available seat to click"
+                    + (f" (tried '{args.seat}')" if args.seat else "")
+                    + " on this date.",
+                    file=sys.stderr,
+                )
+            return 0, seats_to_reserve, []
+        if seats_to_reserve == 2:
+            print(f"Couple chamber found: {', '.join(planned)}")
+        elif seats_to_reserve >= 3:
+            print(f"Chamber seats found: {', '.join(planned)}")
 
     reserved: list[dict] = []
     for n in range(seats_to_reserve):
@@ -565,6 +615,18 @@ def main() -> int:
         help="Click CONTINUE PURCHASE after reserving (default: do not click it)",
     )
     parser.add_argument("--timeout", type=int, default=120000, help="Wait timeout in ms")
+    parser.add_argument(
+        "--seat-retry",
+        action="store_true",
+        help="Keep polling inside the seat layout until the requested "
+        "seats are available (every 5s by default)",
+    )
+    parser.add_argument(
+        "--seat-retry-interval",
+        type=int,
+        default=5,
+        help="Seconds between seat-availability polls (default: 5)",
+    )
     parser.add_argument(
         "--retry-interval",
         type=int,

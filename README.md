@@ -15,11 +15,10 @@ localStorage.getItem('token')  #get current token. Paste below step
 
 Terminal 2:
 ```
-export TOKEN=""
-python train_reserve_browser.py --cdp-port 9222 --from Dhaka --to "Cox's Bazar" --doj 17-Aug-2026 --train "COXS BAZAR EXPRESS (814)" --seats 2 --keep-open --continue
+python train_reserve_browser.py --cdp-port 9222 --from Dhaka --to "Cox's Bazar" --doj 17-Aug-2026 --train "PARJOTAK EXPRESS (816)" --seats 3 --keep-open --seat-class AC_S --seat-retry --continue
 ```
 
-Above command will try to book train ticket for day 17. 
+Above command will try to book train ticket for day 17. It will keep retrying to get the seat.
 
 
 
