@@ -171,6 +171,35 @@ def select_coach_with_seats(page, coach_filter: str | None) -> int | None:
     return None
 
 
+def find_any_seats(page, seats_needed: int, coach_filter: str | None) -> list[str] | None:
+    page.wait_for_selector("#select-bogie", timeout=60000000)
+    page.wait_for_timeout(2000)
+    options = page.locator("#select-bogie option")
+    count = options.count()
+    for i in range(count):
+        opt = options.nth(i)
+        label = opt.inner_text().strip()
+        if coach_filter and coach_filter not in label:
+            continue
+        match = re.search(r"-\s*(\d+)\s*Seat", label)
+        total = int(match.group(1)) if match else 0
+        if total < seats_needed:
+            continue
+        value = opt.get_attribute("value")
+        page.select_option("#select-bogie", value=value)
+        page.wait_for_timeout(1500)
+        seats = page.locator(".btn-seat.seat-available:not(.seat-selected)")
+        if seats.count() >= seats_needed:
+            grabbed: list[str] = []
+            for j in range(seats_needed):
+                text = seats.nth(j).inner_text().strip()
+                if text:
+                    grabbed.append(text)
+            if len(grabbed) == seats_needed:
+                return grabbed
+    return None
+
+
 def find_available_seat(page, seat_filter: str | None, coach_filter: str | None) -> tuple | None:
     page.wait_for_selector("#select-bogie", timeout=60000000)
     page.wait_for_timeout(2000)
@@ -388,25 +417,24 @@ def attempt_booking(
         if seats_to_reserve == 2:
             return find_couple_chamber(page, args.coach)
         if seats_to_reserve >= 3:
-            return find_chamber_with_seats(page, seats_to_reserve, args.coach)
+            return find_any_seats(page, seats_to_reserve, args.coach)
         seat_loc = find_available_seat(page, args.seat, args.coach)
         return [seat_loc[1]] if seat_loc else None
 
     def _open_seat_layout(search_url: str) -> tuple[str, str] | int | None:
-        page.goto(search_url, wait_until="domcontentloaded", timeout=args.timeout)
+        page.goto(search_url, wait_until="commit", timeout=args.timeout)
+        _wait_for_search_results()
+        while page.locator(".no-ticket-found-first-msg").count() > 0:
+            print("No train found; reloading...", file=sys.stderr)
+            page.reload(wait_until="commit", timeout=args.timeout)
+            _wait_for_search_results()
         try:
             page.wait_for_selector("app-single-trip", timeout=args.timeout)
         except Exception:
-            no_train = page.locator(".no-ticket-found-first-msg")
-            if no_train.count() > 0:
-                return -2
             print("No search results appeared.", file=sys.stderr)
             return None
         result = click_book_now(page, args.train, seat_class)
         if not result:
-            no_train = page.locator(".no-ticket-found-first-msg")
-            if no_train.count() > 0:
-                return -2
             print(
                 f"No BOOK NOW button found for '{args.train}'"
                 + (f" / '{seat_class}'" if seat_class else "")
@@ -435,7 +463,12 @@ def attempt_booking(
             if opened == -2:
                 return -2, seats_to_reserve, []
             if not opened:
-                return 0, seats_to_reserve, []
+                print(
+                    f"Failed to load seat layout. Retrying in {args.seat_retry_interval}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(args.seat_retry_interval)
+                continue
             planned = _find_seats() or []
             if not planned:
                 print(
@@ -494,8 +527,7 @@ def attempt_booking(
                 )
             elif seats_to_reserve >= 3:
                 print(
-                    f"No single chamber with {seats_to_reserve} available seats together "
-                    "on this date.",
+                    f"No {seats_to_reserve} available seats found on this date.",
                     file=sys.stderr,
                 )
             else:
@@ -657,7 +689,7 @@ def main() -> int:
     parser.add_argument(
         "--seat-retry-interval",
         type=int,
-        default=5,
+        default=2,
         help="Seconds between seat-availability polls (default: 5)",
     )
     parser.add_argument(

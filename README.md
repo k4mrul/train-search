@@ -17,6 +17,11 @@ Terminal 2:
 ```
 python train_reserve_browser.py --cdp-port 9222 --from Dhaka --to "Cox's Bazar" --doj 17-Aug-2026 --train "PARJOTAK EXPRESS (816)" --seats 3 --keep-open --seat-class AC_S --seat-retry --continue
 ```
+To book any random seats from snighdha
+```
+python train_reserve_browser.py --cdp-port 9222 --from Dhaka --to "Cox's Bazar" --doj 20-Aug-2026 --train "PARJOTAK EXPRESS (816)" --seats 4 --keep-open --seat-retry --seat-class SNIGDHA --continue
+
+```
 
 Above command will try to book train ticket for day 17. It will keep retrying to get the seat.
 
