@@ -315,16 +315,24 @@ def attempt_booking(
     page.on("response", on_response)
     page.on("console", on_console)
 
+    def _wait_for_search_results() -> None:
+        try:
+            page.wait_for_selector("app-single-trip, .no-ticket-found-first-msg", timeout=args.timeout)
+        except Exception:
+            pass
+
     print(f"Loading: {url}")
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+        page.goto(url, wait_until="commit", timeout=args.timeout)
+        _wait_for_search_results()
     except Exception as exc:
         print(f"Navigation failed: {exc}", file=sys.stderr)
         return 0, seats_to_reserve, []
 
     if not attached:
         set_local_storage(page, token or "", args.device_key, args.device_id)
-        page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+        page.goto(url, wait_until="commit", timeout=args.timeout)
+        _wait_for_search_results()
     else:
         if not is_logged_in(page):
             if not token:
@@ -334,7 +342,17 @@ def attempt_booking(
                 )
                 return 0, seats_to_reserve, []
             set_local_storage(page, token, args.device_key, args.device_id)
-            page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+            page.goto(url, wait_until="commit", timeout=args.timeout)
+            _wait_for_search_results()
+
+    while page.locator(".no-ticket-found-first-msg").count() > 0:
+        print("No train found; reloading...", file=sys.stderr)
+        page.reload(wait_until="commit", timeout=args.timeout)
+        _wait_for_search_results()
+        if not attached:
+            set_local_storage(page, token or "", args.device_key, args.device_id)
+            page.reload(wait_until="commit", timeout=args.timeout)
+            _wait_for_search_results()
 
     if args.doj:
         final_doj = url_doj(page.url)
@@ -355,6 +373,9 @@ def attempt_booking(
         print("Search results loaded.")
     except Exception:
         print("No search results appeared.", file=sys.stderr)
+        no_train = page.locator(".no-ticket-found-first-msg")
+        if no_train.count() > 0:
+            return -2, seats_to_reserve, []
         if turnstile_errors:
             print("Turnstile reported errors during page load:", file=sys.stderr)
             for e in turnstile_errors[:5]:
@@ -371,15 +392,21 @@ def attempt_booking(
         seat_loc = find_available_seat(page, args.seat, args.coach)
         return [seat_loc[1]] if seat_loc else None
 
-    def _open_seat_layout(search_url: str) -> tuple[str, str] | None:
+    def _open_seat_layout(search_url: str) -> tuple[str, str] | int | None:
         page.goto(search_url, wait_until="domcontentloaded", timeout=args.timeout)
         try:
             page.wait_for_selector("app-single-trip", timeout=args.timeout)
         except Exception:
+            no_train = page.locator(".no-ticket-found-first-msg")
+            if no_train.count() > 0:
+                return -2
             print("No search results appeared.", file=sys.stderr)
             return None
         result = click_book_now(page, args.train, seat_class)
         if not result:
+            no_train = page.locator(".no-ticket-found-first-msg")
+            if no_train.count() > 0:
+                return -2
             print(
                 f"No BOOK NOW button found for '{args.train}'"
                 + (f" / '{seat_class}'" if seat_class else "")
@@ -404,7 +431,10 @@ def attempt_booking(
         )
         planned: list[str] = []
         while not planned:
-            if not _open_seat_layout(url):
+            opened = _open_seat_layout(url)
+            if opened == -2:
+                return -2, seats_to_reserve, []
+            if not opened:
                 return 0, seats_to_reserve, []
             planned = _find_seats() or []
             if not planned:
@@ -420,6 +450,9 @@ def attempt_booking(
     else:
         result = click_book_now(page, args.train, seat_class)
         if not result:
+            no_train = page.locator(".no-ticket-found-first-msg")
+            if no_train.count() > 0:
+                return -2, seats_to_reserve, []
             print(
                 f"No BOOK NOW button found for '{args.train}'"
                 + (f" / '{seat_class}'" if seat_class else "")
@@ -716,9 +749,12 @@ def main() -> int:
                         page.close()
                     except Exception:
                         pass
+                    if ok_count == -1:
+                        reason = f"Tickets for {doj} are not yet available"
+                    else:
+                        reason = f"No train found for {doj}"
                     print(
-                        f"Tickets for {doj} are not yet available; retrying in "
-                        f"{args.retry_interval}s... (Ctrl+C to stop)",
+                        f"{reason}; retrying in {args.retry_interval}s... (Ctrl+C to stop)",
                         file=sys.stderr,
                     )
                     time.sleep(args.retry_interval)
