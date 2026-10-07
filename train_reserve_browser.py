@@ -417,7 +417,7 @@ def attempt_booking(
         if seats_to_reserve == 2:
             return find_couple_chamber(page, args.coach)
         if seats_to_reserve >= 3:
-            return find_any_seats(page, seats_to_reserve, args.coach)
+            return find_chamber_with_seats(page, seats_to_reserve, args.coach)
         seat_loc = find_available_seat(page, args.seat, args.coach)
         return [seat_loc[1]] if seat_loc else None
 
@@ -453,10 +453,17 @@ def attempt_booking(
         return train_name, cls_name
 
     if args.seat_retry:
-        print(
-            f"Polling for {seats_to_reserve} seat(s) every "
-            f"{args.seat_retry_interval}s — full page refresh each cycle (Ctrl+C to stop)"
-        )
+        if seats_to_reserve >= 3:
+            print(
+                f"Polling for a full {seats_to_reserve}-seat chamber every "
+                f"{args.seat_retry_interval}s — full page refresh each cycle "
+                "(Ctrl+C to stop)"
+            )
+        else:
+            print(
+                f"Polling for {seats_to_reserve} seat(s) every "
+                f"{args.seat_retry_interval}s — full page refresh each cycle (Ctrl+C to stop)"
+            )
         planned: list[str] = []
         while not planned:
             opened = _open_seat_layout(url)
@@ -471,10 +478,17 @@ def attempt_booking(
                 continue
             planned = _find_seats() or []
             if not planned:
-                print(
-                    f"Seats not available. Refreshing in {args.seat_retry_interval}s...",
-                    file=sys.stderr,
-                )
+                if seats_to_reserve >= 3:
+                    print(
+                        f"No full {seats_to_reserve}-seat chamber available. "
+                        f"Refreshing in {args.seat_retry_interval}s...",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Seats not available. Refreshing in {args.seat_retry_interval}s...",
+                        file=sys.stderr,
+                    )
                 time.sleep(args.seat_retry_interval)
         if seats_to_reserve == 2:
             print(f"Couple chamber found: {', '.join(planned)}")
